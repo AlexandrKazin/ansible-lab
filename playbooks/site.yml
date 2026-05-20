@@ -1,0 +1,161 @@
+---
+- name: Применение конфигурации к целевым ВМ
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    package_name: "nginx"
+    package_version: "1.18.0"
+    third_party_repo: "deb https://nginx.org/packages/ubuntu/ jammy nginx"
+    third_party_package: "nginx"
+    config_file: "/etc/nginx/nginx.conf"
+    search_line: "worker_processes auto;"
+    replace_line: "worker_processes 2;"
+    download_url: "https://www.google.com/robots.txt"
+    download_dest: "/home/vagrant/readme.txt"
+    cron_job: "/usr/bin/echo 'Hello from cron'"
+    git_repos:
+      - repo: "https://github.com/ansible/ansible.git"
+        dest: "/home/vagrant/ansible-repo"
+        version: "devel"
+        requirements: "/home/vagrant/ansible-repo/requirements.txt"
+      - repo: "https://github.com/psf/requests.git"
+        dest: "/home/vagrant/requests-repo"
+        version: "main"
+        requirements: null
+      - repo: "https://github.com/pallets/flask.git"
+        dest: "/home/vagrant/flask-repo"
+        version: "main"
+        requirements: null
+
+  tasks:
+    - name: 1. Создать файл с текущим временем и именем пользователя
+      copy:
+        content: |
+          Current time: {{ ansible_date_time.iso8601 }}
+          Current user: vagrant
+        dest: "/home/vagrant/info.txt"
+        owner: vagrant
+        group: vagrant
+        mode: '0644'
+      become: no
+
+    - name: Установить python3-apt (необходим для apt_repository)
+      apt:
+        name: python3-apt
+        state: present
+        update_cache: yes
+
+    - name: 2. Установить пакет {{ package_name }} версии {{ package_version }}
+      apt:
+        name: "{{ package_name }}={{ package_version }}*"
+        state: present
+        update_cache: yes
+
+    - name: 3.0 Установить gnupg для работы с GPG-ключами
+      apt:
+        name: gnupg
+        state: present
+
+    - name: 3.1 Скачать и установить GPG-ключ репозитория Nginx
+      get_url:
+        url: https://nginx.org/keys/nginx_signing.key
+        dest: /etc/apt/trusted.gpg.d/nginx.asc
+        mode: '0644'
+        owner: root
+        group: root
+
+    - name: 3.2 Добавить сторонний репозиторий Nginx с указанием GPG-ключа
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/trusted.gpg.d/nginx.asc] https://nginx.org/packages/ubuntu/ {{ ansible_distribution_release }} nginx"
+        state: present
+        update_cache: yes
+
+    - name: 3.3 Установить Nginx из стороннего репозитория
+      apt:
+        name: "{{ third_party_package }}"
+        state: present
+
+    - name: 4. Заменить строку в {{ config_file }}
+      lineinfile:
+        path: "{{ config_file }}"
+        regexp: "{{ search_line | regex_escape() }}"
+        line: "{{ replace_line }}"
+        backup: yes
+      notify: restart nginx
+
+    - name: 5.1 Создать резервную копию текущего конфига с временной меткой
+      copy:
+        src: "{{ config_file }}"
+        dest: "{{ config_file }}.backup-{{ ansible_date_time.epoch }}"
+        remote_src: yes
+      when: ansible_check_mode == false and config_file is file
+
+    - name: 5.2 Применить новый шаблон конфигурации
+      template:
+        src: /vagrant/templates/nginx.conf.j2
+        dest: "{{ config_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+        backup: no
+      notify: restart nginx
+
+    - name: 6. Скачать файл, если он отсутствует
+      get_url:
+        url: "{{ download_url }}"
+        dest: "{{ download_dest }}"
+        mode: '0644'
+        timeout: 30
+        force: no
+
+    - name: 7. Добавить cron задачу
+      cron:
+        name: "Custom cron job"
+        minute: "0"
+        hour: "2"
+        job: "{{ cron_job }}"
+        state: present
+        user: vagrant
+
+    - name: 8.0 Установить git и pip
+      apt:
+        name:
+          - git
+          - python3-pip
+        state: present
+
+    - name: 8.1 Клонировать git-репозитории
+      git:
+        repo: "{{ item.repo }}"
+        dest: "{{ item.dest }}"
+        version: "{{ item.version | default('main') }}"
+        force: no
+        accept_hostkey: yes
+      become: no
+      loop: "{{ git_repos }}"
+
+    - name: 8.2 Установить зависимости для репозиториев, где есть requirements.txt
+      pip:
+        requirements: "{{ item.requirements }}"
+        executable: pip3
+      loop: "{{ git_repos }}"
+      when: item.requirements is defined and item.requirements != None
+      become: no
+
+    - name: 8.3 Установить пакеты requests и flask (для репозиториев без requirements)
+      pip:
+        name:
+          - requests
+          - flask
+        state: present
+        executable: pip3
+      become: no
+
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+        daemon_reload: yes
